@@ -59,6 +59,184 @@ final class SessionTests: XCTestCase {
         let stall = rows.first { $0.id == "stall" }
         XCTAssertEqual(stall?.xappOk, false)
         XCTAssertEqual(stall?.latchOk, true)
+        let waiting = rows.first { $0.id == "ok" }
+        XCTAssertEqual(waiting?.xappOk, false)
+        XCTAssertEqual(waiting?.latchOk, true)
+    }
+
+    func testInitPacketIs82BytesWithoutALengthPrefix() {
+        let packet = Packets.initCommand(name: "Latch")
+        XCTAssertEqual(packet.count, 82)
+        XCTAssertEqual(LE.u32(packet, 0), 0x52)
+        XCTAssertEqual(LE.u32(packet, 4), 1)
+        XCTAssertEqual(LE.u32(packet, 8), Fuji.version)
+        XCTAssertEqual(LE.u32(packet, 12), 0x5d48a5ad)
+        XCTAssertEqual(LE.u32(packet, 16), 0x0b7fb287)
+        XCTAssertEqual(LE.u32(packet, 20), 0xd0ded5d3)
+        XCTAssertEqual(LE.u32(packet, 24), 0)
+        XCTAssertEqual(packet[28], 0x4c)
+        XCTAssertEqual(packet[29], 0)
+        XCTAssertNotEqual(packet[28], 5)
+        XCTAssertEqual(packet[38], 0)
+    }
+
+    func testEventsDoNotTreatTheObjectCountAsCameraState() {
+        var data = Data(count: 14)
+        LE.put16(&data, 0, 2)
+        LE.put16(&data, 2, UInt16(Fuji.objectCount & 0xffff))
+        LE.put32(&data, 4, 6)
+        LE.put16(&data, 8, UInt16(Fuji.cameraState & 0xffff))
+        LE.put32(&data, 10, 0)
+        XCTAssertEqual(LE.u32(data, 4), 6)
+        XCTAssertEqual(FujiEvents.value(data, prop: Fuji.cameraState), 0)
+        XCTAssertEqual(FujiEvents.value(data, prop: Fuji.objectCount), 6)
+    }
+
+    func testObjectInfoSizeIsNotAlignedAt12() {
+        let info = ObjectInfo.payload(name: "DSCF4418.JPG", bytes: 2_400_000, maxPartial: Fuji.partialMax)
+        XCTAssertEqual(ObjectInfo.compressedSize(info), 2_400_000)
+        XCTAssertEqual(LE.u32(info, 13), 2_400_000)
+        XCTAssertNotEqual(LE.u32(info, 12), 2_400_000)
+        XCTAssertEqual(LE.u32(info, 8), UInt32(Fuji.partialMax))
+        XCTAssertEqual(info[52], 13)
+        XCTAssertEqual(info[53], 0x44)
+        XCTAssertEqual(info[54], 0)
+        XCTAssertNotEqual(info[52], 0x44)
+        XCTAssertEqual(ObjectInfo.filename(info), "DSCF4418.JPG")
+    }
+
+    func testImportHandlesKeepGaps() {
+        let data = FujiArray.encode([4, 9])
+        XCTAssertEqual(FujiArray.handles(data), [4, 9])
+        XCTAssertEqual(FujiArray.handles(FujiArray.encode([])), [])
+    }
+
+    func testPartialWindowsForTheAlleyFrame() async {
+        let frame = Catalog.roll[0]
+        let (result, body, _) = await observe(.latch, frames: [frame], faults: .none, autoOK: true)
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(body.partials.map(\.offset), [0, 0x10_0000, 0x20_0000])
+        XCTAssertEqual(body.partials.map(\.ask), [0x10_0000, 0x10_0000, 302_848])
+        XCTAssertEqual(body.infoSeen.first?.compress, 2)
+        XCTAssertEqual(body.infoSeen.first?.correct, 1)
+        XCTAssertEqual(body.infoSeen.first?.reported, frame.bytes)
+    }
+
+    func testReconnectResetsTheTransactionId() async {
+        let frame = Catalog.roll[0]
+        let faults = Faults(flakyHandshake: true, requireOk: false, stallChunk: true, lieAboutSize: true, impatientOpen: false)
+        let (result, body, lines) = await observe(.latch, frames: [frame], faults: faults, autoOK: true)
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files[0].state, "full")
+        XCTAssertEqual(result.files[0].got, frame.bytes)
+        XCTAssertEqual(body.openTids, [1, 1])
+        XCTAssertEqual(lines.filter { $0.title == "Settle 50 ms" }.count, 2)
+        XCTAssertEqual(body.partials[1].offset, Fuji.stallBytes)
+        XCTAssertFalse(lines.isEmpty)
+        XCTAssertEqual(body.infoSeen.first?.reported, frame.bytes)
+    }
+
+    func testLiveDiscoveryUsesD621NotARange() async {
+        let frames = [
+            CardFrame(handle: 4, name: "DSCF4436.JPG", bytes: 1_800_000, recipe: "Velvia"),
+            CardFrame(handle: 9, name: "DSCF4490.JPG", bytes: 500_000, recipe: "Acros"),
+        ]
+        let (result, body, _) = await observe(.latch, frames: [], bodyFrames: frames, faults: .none, autoOK: true, live: true)
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files.map(\.handle), [4, 9])
+        XCTAssertEqual(result.files.map(\.name), ["DSCF4436.JPG", "DSCF4490.JPG"])
+        XCTAssertEqual(result.files[0].got, 1_800_000)
+        XCTAssertEqual(result.files[1].got, 500_000)
+        XCTAssertFalse(body.partials.contains { $0.handle == 1 || $0.handle == 2 })
+    }
+
+    func testLiveFallsBackToTheObjectCountWhenD621IsEmpty() async {
+        let frames = Array(Catalog.roll.prefix(2))
+        let (result, body, _) = await observe(
+            .latch,
+            frames: [],
+            bodyFrames: frames,
+            faults: .none,
+            autoOK: false,
+            live: true,
+            listed: []
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files.map(\.handle), [1, 2])
+        XCTAssertEqual(body.partials.map(\.handle), [1, 1, 1, 2, 2])
+    }
+
+    func testLiveSkipsADeadHandleAndKeepsTheNext() async {
+        let frames = [
+            CardFrame(handle: 4, name: "DSCF4436.JPG", bytes: 1_800_000, recipe: "Velvia"),
+            CardFrame(handle: 9, name: "DSCF4490.JPG", bytes: 500_000, recipe: "Acros"),
+        ]
+        let (result, body, _) = await observe(
+            .latch,
+            frames: [],
+            bodyFrames: frames,
+            faults: .none,
+            autoOK: true,
+            live: true,
+            listed: [4, 0, 9]
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.files.map(\.state), ["full", "skipped", "full"])
+        XCTAssertEqual(result.files.map(\.name), ["DSCF4436.JPG", "DSCF0000.JPG", "DSCF4490.JPG"])
+        XCTAssertFalse(body.partials.contains { $0.handle == 0 })
+        XCTAssertEqual(body.partials.map(\.handle), [4, 4, 9])
+    }
+
+    func testLiveReadsObjectCountWhenOkAlreadyLanded() async {
+        let frames = Array(Catalog.roll.prefix(2))
+        let (result, _, _) = await observe(
+            .latch,
+            frames: [],
+            bodyFrames: frames,
+            faults: .none,
+            autoOK: true,
+            live: true,
+            listed: []
+        )
+        XCTAssertTrue(result.ok)
+        XCTAssertEqual(result.reason, "imported")
+        XCTAssertEqual(result.files.map(\.handle), [1, 2])
+    }
+
+    func testLiveWithNothingListedFailsClearly() async {
+        let (result, _, _) = await observe(.latch, frames: [], bodyFrames: [], faults: .none, autoOK: true, live: true)
+        XCTAssertFalse(result.ok)
+        XCTAssertEqual(result.reason, "empty")
+        XCTAssertTrue(result.summary.contains("D621"))
+    }
+
+    func testInvalidHandleIsNotInvented() async {
+        let ghost = CardFrame(handle: 0, name: "NOPE.JPG", bytes: 100, recipe: "")
+        let (result, body, _) = await observe(.latch, frames: [ghost], bodyFrames: Catalog.roll, faults: .none, autoOK: true)
+        XCTAssertEqual(result.reason, "object-info")
+        XCTAssertEqual(result.files[0].state, "lost")
+        XCTAssertTrue(body.partials.isEmpty)
+    }
+
+    func testAbortBeforeTheInit() async {
+        let (result, _, lines) = await observe(.latch, frames: [Catalog.roll[0]], faults: .none, autoOK: true, aborted: true)
+        XCTAssertEqual(result.reason, "aborted")
+        XCTAssertEqual(lines.last?.title, "Stopped")
+    }
+
+    func testEmptySelectionDoesNotOpen() async {
+        let (result, _, lines) = await observe(.latch, frames: [], faults: .none, autoOK: true)
+        XCTAssertEqual(result.reason, "empty")
+        XCTAssertTrue(lines.isEmpty)
+    }
+
+    func testXAppStillTrustsTheSizeWhenLatchWouldNot() async {
+        let faults = Faults(flakyHandshake: false, requireOk: false, stallChunk: false, lieAboutSize: true, impatientOpen: false)
+        let (result, body, _) = await observe(.xapp, frames: [Catalog.roll[0]], faults: faults, autoOK: true)
+        XCTAssertEqual(result.reason, "truncated")
+        XCTAssertEqual(result.files[0].got, 102_400)
+        XCTAssertEqual(body.infoSeen.first?.correct, 0)
+        XCTAssertEqual(body.infoSeen.first?.reported, 102_400)
     }
 
     private func run(_ kind: ClientKind, handles: [Int], faults: Faults, autoOK: Bool) async -> RunResult {
@@ -72,5 +250,30 @@ final class SessionTests: XCTestCase {
             options: RunOptions(kind: kind, frames: frames, faults: faults, control: control),
             log: { _ in }
         )
+    }
+
+    private func observe(
+        _ kind: ClientKind,
+        frames: [CardFrame],
+        bodyFrames: [CardFrame]? = nil,
+        faults: Faults,
+        autoOK: Bool,
+        live: Bool = false,
+        listed: [Int]? = nil,
+        aborted: Bool = false
+    ) async -> (RunResult, VirtualBody, [TraceLine]) {
+        let control = RunControl()
+        control.ok = autoOK
+        control.aborted = aborted
+        let body = VirtualBody(faults: faults, control: control, frames: bodyFrames ?? frames)
+        body.listedHandles = listed
+        let link = VirtualLink(body: body)
+        var lines: [TraceLine] = []
+        let result = await Importer.run(
+            link: link,
+            options: RunOptions(kind: kind, frames: frames, faults: faults, control: control, live: live),
+            log: { lines.append($0) }
+        )
+        return (result, body, lines)
     }
 }
