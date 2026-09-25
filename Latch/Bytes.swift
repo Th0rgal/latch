@@ -14,6 +14,8 @@ enum Fuji {
     static let setProp: UInt16 = 0x1016
     static let getPartial: UInt16 = 0x101b
     static let ok: UInt16 = 0x2001
+    static let invalidObject: UInt16 = 0x2009
+    static let sessionAlreadyOpen: UInt16 = 0x201e
 
     static let getExtensionInfo: UInt16 = 0x9054
     static let getExtensionThumb: UInt16 = 0x9055
@@ -23,6 +25,7 @@ enum Fuji {
     static let cameraState: UInt32 = 0xdf00
     static let clientState: UInt32 = 0xdf01
     static let events: UInt32 = 0xd212
+    static let objectCount: UInt32 = 0xd222
     static let imageGetVersion: UInt32 = 0xdf21
     static let objectVersion: UInt32 = 0xdf22
     static let remoteVersion: UInt32 = 0xdf24
@@ -163,6 +166,7 @@ enum LinkError: Error {
     case closed
     case timeout
     case rejected
+    case response(UInt16)
 }
 
 protocol ByteLink: AnyObject, Sendable {
@@ -170,4 +174,83 @@ protocol ByteLink: AnyObject, Sendable {
     func write(_ data: Data) async throws
     func read(count: Int) async throws -> Data
     func close() async
+}
+
+/// Packed `PtpFujiEvents`: u16 count, then {u16 code, u32 value}. DF00 is not always first.
+enum FujiEvents {
+    struct Item: Equatable {
+        var code: UInt16
+        var value: UInt32
+    }
+
+    static func parse(_ data: Data) -> [Item] {
+        guard data.count >= 2 else { return [] }
+        let count = Int(LE.u16(data, 0))
+        var items: [Item] = []
+        var offset = 2
+        for _ in 0..<count {
+            guard offset + 6 <= data.count else { break }
+            items.append(Item(code: LE.u16(data, offset), value: LE.u32(data, offset + 2)))
+            offset += 6
+        }
+        return items
+    }
+
+    static func value(_ data: Data, prop: UInt32) -> UInt32? {
+        let code = UInt16(prop & 0xffff)
+        return parse(data).first { $0.code == code }?.value
+    }
+}
+
+/// Device-prop array as libpict reads it: u32 count, then that many u32s.
+enum FujiArray {
+    static func handles(_ data: Data) -> [Int] {
+        guard data.count >= 4 else { return [] }
+        let count = Int(LE.u32(data, 0))
+        guard count > 0, count <= 20_000, data.count >= 4 + count * 4 else { return [] }
+        return (0..<count).map { Int(LE.u32(data, 4 + $0 * 4)) }
+    }
+
+    static func encode(_ values: [Int]) -> Data {
+        var data = Data(count: 4 + values.count * 4)
+        LE.put32(&data, 0, UInt32(values.count))
+        for (index, value) in values.enumerated() {
+            LE.put32(&data, 4 + index * 4, UInt32(value))
+        }
+        return data
+    }
+}
+
+/// Packed `PtpFujiObjectInfo`. compressed_size is the unaligned u32 at offset 13, not 12.
+enum ObjectInfo {
+    static let sizeOffset = 13
+    static let nameOffset = 52
+
+    static func payload(name: String, bytes: Int, maxPartial: Int) -> Data {
+        var data = Data(count: 208)
+        LE.put32(&data, 8, UInt32(maxPartial))
+        LE.put32(&data, sizeOffset, UInt32(bytes))
+        let raw = Array(name.utf8)
+        for (index, byte) in raw.enumerated() where nameOffset + index < data.count {
+            data[nameOffset + index] = byte
+        }
+        return data
+    }
+
+    static func compressedSize(_ data: Data) -> Int? {
+        guard data.count >= sizeOffset + 4 else { return nil }
+        return Int(LE.u32(data, sizeOffset))
+    }
+
+    static func filename(_ data: Data) -> String? {
+        guard data.count > nameOffset else { return nil }
+        var raw: [UInt8] = []
+        var index = nameOffset
+        while index < data.count, data[index] != 0, raw.count < 63 {
+            raw.append(data[index])
+            index += 1
+        }
+        guard !raw.isEmpty else { return nil }
+        return String(bytes: raw, encoding: .utf8)
+    }
 }
