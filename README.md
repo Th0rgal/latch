@@ -16,7 +16,7 @@ Latch, compared with the way that session usually dies:
 - sets client state `0xDF01 = 20` (XApp gallery)
 - reads `0xD621` for the import handles, and only falls back to `1..count` when that list is empty
 - sets `0xD226 = 2` and `0xD227 = 1` before each file, then both back to 0. Until D227 is 1, ObjectInfo reports about 100 KB
-- reads with `GetPartialObject` (`0x101B`) in 1 MB pieces and resumes from the last offset
+- reads `GetPartialObject` (`0x101B`) in 1 MB pieces and resumes from the last offset. `compressed_size` is the unaligned word at offset 13. The filename is a PTP string at offset 52 (length byte, then UTF-16), not raw ASCII.
 
 ## Two modes
 
@@ -34,6 +34,6 @@ xcodegen generate
 open Latch.xcodeproj
 ```
 
-Team is set to the same development team as OpenHealth. Run `LatchTests` for the session: init retry, stall resume at transaction id 1, size lie, D621 handles, partial offsets, and the event layout. Those tests run against the in-process body. They do not join a camera.
+Team is set to the same development team as OpenHealth. Run `LatchTests` for the session: init retry, stall resume at transaction id 1, size lie, D621 handles, partial offsets, the event layout, PTP-string filenames, and a live list that skips a dead handle. Those tests run against the in-process body. They do not join a camera.
 
 The phone has to be on the camera’s network. Latch cannot join that SSID for you without the Hotspot Configuration entitlement.

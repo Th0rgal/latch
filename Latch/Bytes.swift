@@ -221,7 +221,8 @@ enum FujiArray {
     }
 }
 
-/// Packed `PtpFujiObjectInfo`. compressed_size is the unaligned u32 at offset 13, not 12.
+/// Packed `PtpFujiObjectInfo`. `compressed_size` is the unaligned u32 at offset 13.
+/// The filename is a PTP string (u8 length, then UTF-16) starting at offset 52, not raw ASCII.
 enum ObjectInfo {
     static let sizeOffset = 13
     static let nameOffset = 52
@@ -230,10 +231,7 @@ enum ObjectInfo {
         var data = Data(count: 208)
         LE.put32(&data, 8, UInt32(maxPartial))
         LE.put32(&data, sizeOffset, UInt32(bytes))
-        let raw = Array(name.utf8)
-        for (index, byte) in raw.enumerated() where nameOffset + index < data.count {
-            data[nameOffset + index] = byte
-        }
+        writeString(&data, nameOffset, name)
         return data
     }
 
@@ -242,15 +240,38 @@ enum ObjectInfo {
         return Int(LE.u32(data, sizeOffset))
     }
 
+    /// libfuji copies 52 fixed bytes, then `ptp_read_string` for the name.
     static func filename(_ data: Data) -> String? {
         guard data.count > nameOffset else { return nil }
+        let length = Int(data[nameOffset])
+        if length == 0 { return nil }
         var raw: [UInt8] = []
-        var index = nameOffset
-        while index < data.count, data[index] != 0, raw.count < 63 {
-            raw.append(data[index])
-            index += 1
+        var cursor = nameOffset + 1
+        var left = length
+        while left > 0, cursor + 1 < data.count, raw.count < 63 {
+            let unit = LE.u16(data, cursor)
+            cursor += 2
+            left -= 1
+            if unit == 0 { break }
+            if unit < 32 || unit > 126 { continue }
+            raw.append(UInt8(unit & 0xff))
         }
         guard !raw.isEmpty else { return nil }
         return String(bytes: raw, encoding: .utf8)
+    }
+
+    private static func writeString(_ data: inout Data, _ offset: Int, _ name: String) {
+        let units = Array(name.utf16.prefix(31))
+        guard offset < data.count else { return }
+        data[offset] = UInt8(units.count + 1)
+        var cursor = offset + 1
+        for unit in units {
+            guard cursor + 2 <= data.count else { return }
+            LE.put16(&data, cursor, unit)
+            cursor += 2
+        }
+        if cursor + 2 <= data.count {
+            LE.put16(&data, cursor, 0)
+        }
     }
 }
