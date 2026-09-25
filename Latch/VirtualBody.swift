@@ -36,12 +36,26 @@ final class VirtualBody: @unchecked Sendable {
     private(set) var correctSize: UInt16 = 0
     private var stallArmed: Bool
     private var pendingSet: UInt32?
+    private var failNextInit: Bool
+    private(set) var openTids: [UInt32] = []
+    private(set) var partials: [(handle: Int, offset: Int, ask: Int)] = []
+    private(set) var compressSmall: UInt16 = 0
+    /// Nil lists the card. An empty array is a body that answered D621 with no handles.
+    var listedHandles: [Int]?
+    private(set) var infoSeen: [(handle: Int, compress: UInt16, correct: UInt16, reported: Int)] = []
 
     init(faults: Faults, control: RunControl, frames: [CardFrame]) {
         self.faults = faults
         self.control = control
         self.frames = frames
         self.stallArmed = faults.stallChunk
+        self.failNextInit = false
+        self.listedHandles = nil
+    }
+
+    /// Each new command socket may Init-Fail once. libfuji retries that per handshake.
+    func noteConnect() {
+        failNextInit = faults.flakyHandshake
     }
 
     var cameraState: UInt32 {
@@ -67,7 +81,8 @@ final class VirtualBody: @unchecked Sendable {
 
     private func handshake() -> Reply {
         initCount += 1
-        if faults.flakyHandshake && initCount == 1 {
+        if failNextInit {
+            failNextInit = false
             var fail = Data(count: 16)
             LE.put32(&fail, 0, 16)
             LE.put32(&fail, 4, 5)
@@ -89,6 +104,9 @@ final class VirtualBody: @unchecked Sendable {
         let tid = LE.u32(packet, 8)
         let params = paramsOf(packet)
         switch code {
+        case Fuji.openSession:
+            openTids.append(tid)
+            return .bytes(Packets.response(code: code, tid: tid))
         case Fuji.setProp:
             pendingSet = params.first ?? 0
             return .silent
@@ -99,6 +117,9 @@ final class VirtualBody: @unchecked Sendable {
                 + Packets.response(code: code, tid: tid))
         case Fuji.getObjectInfo:
             let handle = Int(params.first ?? 0)
+            guard frames.contains(where: { $0.handle == handle }) else {
+                return .bytes(Packets.response(code: code, tid: tid, rc: Fuji.invalidObject))
+            }
             let payload = objectInfo(handle)
             return .bytes(Packets.dataPhase(code: code, tid: tid, payload: payload)
                 + Packets.response(code: code, tid: tid))
@@ -106,6 +127,10 @@ final class VirtualBody: @unchecked Sendable {
             let handle = Int(params.first ?? 0)
             let offset = Int(params.count > 1 ? params[1] : 0)
             let ask = Int(params.count > 2 ? params[2] : 0)
+            guard frames.contains(where: { $0.handle == handle }) else {
+                return .bytes(Packets.response(code: code, tid: tid, rc: Fuji.invalidObject))
+            }
+            partials.append((handle, offset, ask))
             return partial(handle: handle, offset: offset, ask: ask, code: code, tid: tid)
         default:
             return .bytes(Packets.response(code: code, tid: tid))
@@ -129,10 +154,14 @@ final class VirtualBody: @unchecked Sendable {
     private func propValue(_ prop: UInt32) -> Data {
         switch prop {
         case Fuji.events:
-            var data = Data(count: 8)
-            LE.put16(&data, 0, 1)
-            LE.put16(&data, 2, UInt16(Fuji.cameraState & 0xffff))
-            LE.put32(&data, 4, cameraState)
+            // Count, then {code, value}. D222 is first on purpose: a client that
+            // reads a u32 at offset 4 would treat the object count as DF00.
+            var data = Data(count: 14)
+            LE.put16(&data, 0, 2)
+            LE.put16(&data, 2, UInt16(Fuji.objectCount & 0xffff))
+            LE.put32(&data, 4, UInt32(frames.count))
+            LE.put16(&data, 8, UInt16(Fuji.cameraState & 0xffff))
+            LE.put32(&data, 10, cameraState)
             return data
         case Fuji.objectVersion, Fuji.remoteVersion:
             return LE.data32(0x0002_000c)
@@ -144,6 +173,9 @@ final class VirtualBody: @unchecked Sendable {
             return LE.data32(1)
         case Fuji.importCount:
             return LE.data32(UInt32(frames.count))
+        case Fuji.importHandles:
+            let handles = listedHandles ?? frames.map(\.handle)
+            return FujiArray.encode(handles)
         default:
             return LE.data32(0)
         }
@@ -159,22 +191,17 @@ final class VirtualBody: @unchecked Sendable {
         if prop == Fuji.correctSize {
             correctSize = value
         }
+        if prop == Fuji.compressSmall {
+            compressSmall = value
+        }
     }
 
     private func objectInfo(_ handle: Int) -> Data {
-        var data = Data(count: 208)
-        LE.put32(&data, 8, UInt32(Fuji.partialMax))
         let frame = frames.first { $0.handle == handle }
         let real = frame?.bytes ?? 0
         let reported = (faults.lieAboutSize && correctSize == 0) ? Fuji.liedSize : real
-        LE.put32(&data, 13, UInt32(reported))
-        if let name = frame?.name {
-            let bytes = Array(name.utf8)
-            for (index, byte) in bytes.enumerated() where 52 + index < data.count {
-                data[52 + index] = byte
-            }
-        }
-        return data
+        infoSeen.append((handle, compressSmall, correctSize, reported))
+        return ObjectInfo.payload(name: frame?.name ?? "", bytes: reported, maxPartial: Fuji.partialMax)
     }
 
     private func paramsOf(_ packet: Data) -> [UInt32] {
@@ -203,6 +230,7 @@ final class VirtualLink: ByteLink, @unchecked Sendable {
         incoming.removeAll()
         outgoing.removeAll()
         stalled = false
+        body.noteConnect()
     }
 
     func close() async {
