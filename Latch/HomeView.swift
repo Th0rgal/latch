@@ -110,7 +110,7 @@ struct HomeView: View {
                     model.start(.xapp)
                 }
                 .disabled(model.busy || model.selected.isEmpty)
-                QuietButton(title: model.phase == "Comparing" ? "Comparing\u2026" : "Compare the five stalls") {
+                QuietButton(title: model.phase == "Comparing" ? "Comparing…" : "Compare the five stalls") {
                     model.runCompare()
                 }
                 .disabled(model.busy || model.selected.isEmpty)
@@ -163,7 +163,7 @@ struct HomeView: View {
                             value: file.map { caption($0) } ?? (on ? "selected" : "left"),
                             tone: file?.state == "full" ? Ink.good : (file?.state == "partial" || file?.state == "lost" ? Ink.bad : Ink.ink)
                         )
-                        Text("\(frame.recipe) \u00b7 \(ByteFormat.string(frame.bytes))")
+                        Text("\(frame.recipe) · \(ByteFormat.string(frame.bytes))")
                             .font(Ink.mono(12))
                             .foregroundStyle(Ink.muted)
                     }
@@ -183,13 +183,13 @@ struct HomeView: View {
                     Text(row.fault)
                         .font(Ink.serif(18))
                         .foregroundStyle(Ink.ink)
-                    Text("XApp \u00b7 \(row.xappOk ? "keeps going" : "stops")")
+                    Text("XApp · \(row.xappOk ? "keeps going" : "stops")")
                         .font(Ink.mono(12))
                         .foregroundStyle(row.xappOk ? Ink.good : Ink.bad)
                     Text(row.xapp)
                         .font(Ink.prose(14))
                         .foregroundStyle(Ink.ink2)
-                    Text("Latch \u00b7 \(row.latchOk ? "keeps going" : "stops")")
+                    Text("Latch · \(row.latchOk ? "keeps going" : "stops")")
                         .font(Ink.mono(12))
                         .foregroundStyle(row.latchOk ? Ink.good : Ink.bad)
                     Text(row.latch)
@@ -284,7 +284,7 @@ struct NotesView: View {
                 note("4", "DF01 = 20", "Remote image view, the XApp gallery dialect. Classic playback writes 2.")
                 note("5", "D227", "Until this is 1, ObjectInfo reports about 100 KB and a client that trusts it writes a short JPEG.")
                 note("6", "0x101B", "GetPartialObject, at most 1 MB. If the socket dies, keep the offset and ask again. The body usually does not ask for OK a second time.")
-                Text("The sequence follows the published libfuji client, not a decompile of XApp. This phone cannot prove what today\u2019s iOS XApp binary does. It can show where a session that behaves like that client gives up, and it can talk to the camera when you are on its Wi-Fi.")
+                Text("The sequence follows the published libfuji client, not a decompile of XApp. This phone cannot prove what today’s iOS XApp binary does. It can show where a session that behaves like that client gives up, and it can talk to the camera when you are on its Wi-Fi.")
                     .font(Ink.prose(15))
                     .foregroundStyle(Ink.muted)
             }
