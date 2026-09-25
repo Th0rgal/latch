@@ -64,16 +64,13 @@ final class BenchModel {
                     }
                 )
             } else {
-                let frames = (1...80).map {
-                    CardFrame(handle: $0, name: String(format: "DSCF%04d.JPG", 4400 + $0), bytes: 0, recipe: "")
-                }
                 let link = TCPLink()
                 let dir = Self.folder()
                 result = await Importer.run(
                     link: link,
                     options: RunOptions(
                         kind: .latch,
-                        frames: frames,
+                        frames: [],
                         faults: .none,
                         control: control,
                         paceNanos: 0,
